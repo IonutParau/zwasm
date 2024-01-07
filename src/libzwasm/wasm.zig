@@ -17,7 +17,7 @@ pub const RefType = union(enum) {
 pub const ValueType = union(enum) {
     num: NumType,
     vec,
-    ref,
+    ref: RefType,
 };
 pub const ResultType = std.ArrayList(ValueType);
 pub const FunctionType = struct {
@@ -28,6 +28,11 @@ pub const FunctionType = struct {
 pub const Locals = struct {
     count: u32,
     t: ValueType,
+};
+
+pub const CodeDef = struct {
+    code: []const u8,
+    locals: std.ArrayList(Locals),
 };
 
 pub const Sections = struct {
@@ -45,8 +50,7 @@ pub const Sections = struct {
     };
 
     pub const Code = struct {
-        locals: std.ArrayList(Locals),
-        code: []const u8,
+        definitions: std.ArrayList(CodeDef),
     };
 };
 
@@ -217,5 +221,135 @@ pub const WasmModule = struct {
 
     pub fn parseFunctionSection(self: *WasmModule) WasmError!?Sections.Function {
         return self.parseSection(Sections.Function, 3, functionSectionParser);
+    }
+
+    pub fn nextExpression(self: *WasmModule) WasmError![]const u8 {
+        var i = self.i;
+        var binary = self.binary;
+        var j = self.i;
+
+        while (try self.next(u8) != 0x0B) {
+            j += 1;
+        }
+
+        return binary[i..j];
+    }
+
+    pub fn nextValType(self: *WasmModule) WasmError!ValueType {
+        const byte = try self.next(u8);
+        switch (byte) {
+            0x7F => ValueType{ .num = NumType{.int32} },
+            0x7E => ValueType{ .num = NumType{.int64} },
+            0x7D => ValueType{ .num = NumType{.float32} },
+            0x7C => ValueType{ .num = NumType{.float64} },
+            0x7B => ValueType{.vec},
+            0x70 => ValueType{ .ref = RefType{.funcref} },
+            0x6F => ValueType{ .ref = RefType{.externref} },
+            else => return WasmError.InvalidByte,
+        }
+    }
+
+    pub fn nextResultType(self: *WasmModule) WasmError!ResultType {
+        var len = try self.next(u32);
+        var array = ResultType.init(self.allocator);
+        errdefer array.deinit();
+
+        while (len > 0) : (len -= 1) {
+            try array.append(try self.nextValType());
+        }
+
+        return array;
+    }
+
+    pub fn nextFunctionType(self: *WasmModule) WasmError!FunctionType {
+        if (try self.next(u32) != 0x60) {
+            return WasmError.InvalidByte;
+        }
+
+        const inputs = try self.nextResultType();
+        const outputs = try self.nextResultType();
+
+        return FunctionType{
+            .inputs = inputs,
+            .outputs = outputs,
+        };
+    }
+
+    // size + buffer where ||buffer|| = size
+    fn nextBuffer(self: *WasmModule) WasmError![]const u8 {
+        const len = try self.next(u32);
+        const buffer = self.binary[self.i .. self.i + len];
+        self.i += len;
+        return buffer;
+    }
+
+    fn codeSectionParser(self: WasmModule) WasmError!Sections.Code {
+        var codelen = try self.next(u32);
+        var definitions = std.ArrayList(CodeDef).init(self.allocator);
+        errdefer definitions.deinit();
+
+        while (codelen > 0) : (codelen -= 1) {
+            const function_buffer = try self.nextBuffer();
+            var func = WasmModule.init(function_buffer, self.allocator); // this is to use convenience functions
+
+            var localc = try func.next(u32);
+            var locals = try std.ArrayList(Locals).initCapacity(self.allocator, @intCast(localc));
+            errdefer locals.deinit();
+
+            while (localc > 0) : (localc -= 1) {
+                const count = try func.next(u32);
+                const t = try func.nextValType();
+
+                const local = Locals{
+                    .count = count,
+                    .t = t,
+                };
+
+                try locals.append(local);
+            }
+
+            var expression = try func.nextExpression();
+
+            if (!func.done()) {
+                return WasmError.WrongSize;
+            }
+
+            const def = CodeDef{
+                .code = expression,
+                .locals = locals,
+            };
+
+            try definitions.append(def);
+        }
+
+        return Sections.Code{
+            .definitions = definitions,
+        };
+    }
+
+    pub fn done(self: *WasmModule) bool {
+        return self.i == self.binary.len;
+    }
+
+    pub fn parseCodeSection(self: *WasmModule) WasmError!?Sections.Custom {
+        return self.parseSection(Sections.Custom, 10, codeSectionParser);
+    }
+
+    fn typeSectionParser(self: WasmModule) WasmError!Sections.Type {
+        var types = std.ArrayList(FunctionType).init(self.allocator);
+        errdefer types.deinit();
+        var len = try self.next(u32);
+
+        while (len > 0) : (len -= 1) {
+            try types.append(try self.nextFunctionType());
+        }
+
+        return Sections.Type{
+            .types = types,
+        };
+    }
+
+    pub fn parseTypeSection(self: *WasmModule) WasmError!?Sections.Type {
+        return self.parseSection(Sections.Type, 1, typeSectionParser);
     }
 };
